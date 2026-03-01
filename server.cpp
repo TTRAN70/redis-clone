@@ -16,7 +16,16 @@
 
 #pragma include(lib, "Ws2_32.lib")
 
-const size_t k_max_msg = 4096;
+const size_t k_max_msg = 32 << 20;
+
+struct Conn {
+    SOCKET fd = -1;
+    bool want_read = false;
+    bool want_write = false;
+    bool want_close = false;
+    std::vector<uint8_t> incoming;
+    std::vector<uint8_t> outgoing;
+};
 
 static void die(const char* message) {
     std::cout << "failed:" << message << std::endl;
@@ -26,57 +35,137 @@ static void msg(const char* message) {
     std::cout << message << std::endl;
 }
 
-static int32_t read_full(SOCKET fd, char* rbuf, size_t n) {
-    while (n > 0) {
-        SSIZE_T rv = recv(fd, rbuf, n, 0);
-        if (rv <= 0) { return -1; } // error or unexpected EOF
-        
-        assert((size_t)rv <= n);
-        n -= (size_t)rv;
-        rbuf += rv;
-    }
-    return 0;
+// append to the back
+static void buf_append(std::vector<uint8_t> &buf, const uint8_t *data, size_t len) {
+    buf.insert(buf.end(), data, data + len);
+}
+// remove from the front
+static void buf_consume(std::vector<uint8_t> &buf, size_t n) {
+    buf.erase(buf.begin(), buf.begin() + n);
 }
 
-static int32_t write_all(SOCKET fd, char* wbuf, size_t n) {
-    while (n > 0) {
-        SSIZE_T rv = send(fd, wbuf, n, 0);
-        if (rv <= 0) { return -1; } // error
+static void fd_set_nb(SOCKET fd) {
+    unsigned long nonBlockingMode = 1; // 1 for non-blocking, 0 for blocking
+    int result = ioctlsocket(fd, FIONBIO, &nonBlockingMode);
+    if (result == SOCKET_ERROR) {
         
-        assert((size_t)rv <= n);
-        n -= (size_t)rv;
-        wbuf += rv;
     }
-    return 0;
 }
 
-static int32_t one_request(SOCKET connfd) {
-    char rbuf[4 + k_max_msg];
-    int32_t err = read_full(connfd, rbuf, 4);
-    errno = 0;
-    if (err) {
-        msg(errno == 0 ? "EOF" : "read() error");
-        return err;
+static Conn *handle_accept(SOCKET fd) {
+    // accept
+    struct sockaddr_in client_addr = {};
+    socklen_t addrlen = sizeof(client_addr);
+    SOCKET connfd = accept(fd, (struct sockaddr *)&client_addr, &addrlen);
+    if (connfd < 0) {
+        msg("accept() error"); 
+        return NULL; 
+    } // error
+
+    uint32_t ip = client_addr.sin_addr.s_addr;
+    fprintf(stderr, "new client from %u.%u.%u.%u:%u\n",
+        ip & 255, (ip >> 8) & 255, (ip >> 16) & 255, ip >> 24,
+        ntohs(client_addr.sin_port)
+    );
+
+    // set to non-blocking mode
+    fd_set_nb(connfd);
+    
+    // construct new conn
+    Conn *conn = new Conn();
+    conn->fd = connfd;
+    conn->want_read = true;
+    return conn;
+}
+
+static void handle_write(Conn *conn) {
+    assert(conn->outgoing.size() > 0);  
+    SSIZE_T rv = send(conn->fd, (char *)conn->outgoing.data(), conn->outgoing.size(), 0);
+    if (rv < 0 && errno == EAGAIN) {
+        return; // actually not ready
+    }
+    if (rv < 0) {
+        msg("write() error");
+        conn->want_close = true;
+        return;
+    }
+
+    // remove written data from outgoing
+    buf_consume(conn->outgoing, (size_t)rv);
+
+    if (conn->outgoing.size() == 0) {
+        conn->want_read = true;
+        conn->want_write = false;
+    }
+}
+
+static bool try_one_request(Conn *conn) {
+    if (conn->incoming.size() < 4) {
+        return false; // want read, not enough data
     }
 
     uint32_t len = 0;
-    memcpy(&len, rbuf, 4);
-    if (len > k_max_msg) { msg("too long"); return -1; }
-
-    err = read_full(connfd, &rbuf[4], len);
-    if (err) {
-        msg("read() error");
-        return err;
+    memcpy(&len, conn->incoming.data(), 4);
+    if (len > k_max_msg) {  // protocol error
+        conn->want_close = true;
+        return false;   // want close
     }
 
-    std::cout << "client says: " << &rbuf[4] << std::endl;
+    // Protocol message body
+    if (4 + len > conn->incoming.size()) {
+        return false; // want read, not enough data
+    }
 
-    const char reply[] = "world";
-    char wbuf[4 + sizeof(reply)];
-    len = (uint32_t)strlen(reply);
-    memcpy(wbuf, &len, 4);
-    memcpy(&wbuf[4], reply, len);
-    return write_all(connfd, wbuf, 4 + len);
+    const uint8_t *request = &conn->incoming[4];
+
+    std::cout << "client says: " << request << std::endl;
+
+    // 4. Process the parsed message
+    // ...
+    // generate the response (Echo)
+    buf_append(conn->outgoing, (const uint8_t *)&len, 4);
+    buf_append(conn->outgoing, request, len);
+    buf_consume(conn->incoming, 4 + len);
+    return true;        // success
+}
+
+static void handle_read(Conn* conn) {
+    // 1. Do a non-blocking read
+    uint8_t buf[64 * 1024];
+    SSIZE_T rv = recv(conn->fd, (char *)buf, sizeof(buf), 0);
+     if (rv < 0 && errno == EAGAIN) {
+        return; // actually not ready
+    }
+    if (rv <= 0) {
+        conn->want_close = true;
+        return;
+    }
+
+    // handle EOF
+    if (rv == 0) {
+        if (conn->incoming.size() == 0) {
+            msg("client closed");
+        } else {
+            msg("unexpected EOF");
+        }
+        conn->want_close = true;
+        return; // want close
+    }
+
+    // 2. Add new data to incoming buffer
+    buf_append(conn->incoming, buf, (size_t)rv);
+
+    // 3. Try to parse accumulated buffer
+    while (try_one_request(conn)) {}
+
+    if (conn->outgoing.size() > 0) {
+        conn->want_read = false;
+        conn->want_write = true;
+        // The socket is likely ready to write in a request-response protocol,
+        // try to write it without waiting for the next iteration.
+        handle_write(conn);
+    }
+
 }
 
 int main() { 
@@ -105,23 +194,88 @@ int main() {
     int rv = bind(fd, (const struct sockaddr *)&addr, sizeof(addr));
     if (rv) { die("bind()"); }
 
+     fd_set_nb(fd);
+
     rv = listen(fd, SOMAXCONN);
     if (rv) { die("listen()"); }
 
+    // All client connections, mapped by fd
+    std::unordered_map<SOCKET, Conn *> fd2conn;
+    std::vector<SOCKET> sockets;
+    
+    // Event loop
+    fd_set readfds;
+    fd_set writefds;
+    fd_set exceptfds;
+
     while(true) {
-        struct sockaddr_in client_addr = {};
-        socklen_t addrlen = sizeof(client_addr);
-        SOCKET connfd = accept(fd, (struct sockaddr *)&client_addr, &addrlen);
-        if (connfd < 0) { continue; } // error
+        sockets.clear();
+        FD_ZERO(&readfds);
+        FD_ZERO(&writefds);
+        FD_ZERO(&exceptfds);
+        FD_SET(fd, &readfds);
+        FD_SET(fd, &exceptfds);
+        
+        // Put listening sock back first
+        sockets.push_back(fd);
 
-        // only serves one request at once
-        while(true) {
-            int32_t err = one_request(connfd);
-            if (err) { break; }
+        // Handle rest of connection sockets
+        for (const auto& connection: fd2conn) {
+            Conn* conn = connection.second;
+
+            if (!conn) continue;
+
+            FD_SET(conn->fd, &exceptfds);
+
+            if (conn->want_read) FD_SET(conn->fd, &readfds);
+            if (conn->want_write) FD_SET(conn->fd, &writefds);
+
+            sockets.push_back(conn->fd);
         }
-        closesocket(connfd);
-    }
 
+        int rv = select(0, &readfds, &writefds, &exceptfds, NULL);
+
+        if (rv == SOCKET_ERROR) {
+            die("Poll");
+            break;
+        }
+        if (rv == 0) continue;
+        if (rv < 0 && errno == EINTR) continue;
+        if (rv < 0) {
+            die("Poll");
+            break;
+        }
+        
+        if (FD_ISSET(fd, &readfds)) {
+            if (Conn *conn = handle_accept(fd)) {
+                // Put it into our map
+                assert(!fd2conn[conn->fd]);
+                fd2conn[conn->fd] = conn;
+            }
+        }
+
+        for (size_t i = 1; i < sockets.size(); ++i) {
+            SOCKET socket = sockets[i];
+            Conn *conn = fd2conn[socket];
+
+            if (FD_ISSET(socket, &readfds)) {
+                assert(conn->want_read);
+                handle_read(conn); // app logic
+            }
+
+            if (FD_ISSET(socket, &writefds)) {
+                assert(conn->want_write);
+                handle_write(conn); // app logic
+            }
+
+            if (FD_ISSET(socket, &exceptfds) || conn->want_close) {
+                closesocket(conn->fd);
+                fd2conn.erase(socket);
+                delete conn;
+            }
+
+        }
+    }
     closesocket(fd);
     WSACleanup();
     return 0;
