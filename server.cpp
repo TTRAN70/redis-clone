@@ -14,8 +14,13 @@
 #include <vector>
 #include <unordered_map>
 #include <map>
+// proj
+#include "hashtable.h"
 
 #pragma include(lib, "Ws2_32.lib")
+
+#define container_of(ptr, T, member) \
+    ((T *)( (char *)ptr - offsetof(T, member) ))
 
 const size_t k_max_msg = 32 << 20;
 
@@ -42,6 +47,93 @@ struct Response {
     uint32_t status = 0;
     std::vector<uint8_t> data;
 };
+
+static struct {
+    HMap db;    // top-level hashtable
+} g_data;
+
+// KV pair for the top-level hashtable
+struct Entry {
+    struct HNode node;  // hashtable node
+    std::string key;
+    std::string val;
+};
+
+static bool entry_eq(HNode *lhs, HNode *rhs) {
+    struct Entry *le = container_of(lhs, struct Entry, node);
+    struct Entry *re = container_of(rhs, struct Entry, node);
+    return le->key == re->key;
+}
+
+// FNV hash
+static uint64_t str_hash(const uint8_t *data, size_t len) {
+    uint32_t h = 0x811C9DC5;
+    for (size_t i = 0; i < len; i++) {
+        h = (h + data[i]) * 0x01000193;
+    }
+    return h;
+}
+
+static void do_get(std::vector<std::string> &cmd, Response &out) {
+    // a dummy `Entry` just for the lookup
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    // hashtable lookup
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (!node) {
+        out.status = RES_NX;
+        return;
+    }
+    // copy the value
+    const std::string &val = container_of(node, Entry, node)->val;
+    assert(val.size() <= k_max_msg);
+    out.data.assign(val.begin(), val.end());
+}
+
+static void do_set(std::vector<std::string> &cmd, Response &) {
+    // a dummy `Entry` just for the lookup
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    // hashtable lookup
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (node) {
+        // found, update the value
+        container_of(node, Entry, node)->val.swap(cmd[2]);
+    } else {
+        // not found, allocate & insert a new pair
+        Entry *ent = new Entry();
+        ent->key.swap(key.key);
+        ent->node.hcode = key.node.hcode;
+        ent->val.swap(cmd[2]);
+        hm_insert(&g_data.db, &ent->node);
+    }
+}
+
+static void do_del(std::vector<std::string> &cmd, Response &) {
+    // a dummy `Entry` just for the lookup
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    // hashtable delete
+    HNode *node = hm_delete(&g_data.db, &key.node, &entry_eq);
+    if (node) { // deallocate the pair
+        delete container_of(node, Entry, node);
+    }
+}
+
+static void do_request(std::vector<std::string> &cmd, Response &out) {
+    if (cmd.size() == 2 && cmd[0] == "get") {
+        return do_get(cmd, out);
+    } else if (cmd.size() == 3 && cmd[0] == "set") {
+        return do_set(cmd, out);
+    } else if (cmd.size() == 2 && cmd[0] == "del") {
+        return do_del(cmd, out);
+    } else {
+        out.status = RES_ERR;       // unrecognized command
+    }
+}
 
 static void die(const char* message) {
     std::cout << "failed:" << message << std::endl;
@@ -92,52 +184,6 @@ static Conn *handle_accept(SOCKET fd) {
     conn->fd = connfd;
     conn->want_read = true;
     return conn;
-}
-
-// placeholder; implemented later
-static std::map<std::string, std::string> g_data = {
-    // Basic string values
-    {"name",     "Alice"},
-    {"city",     "New York"},
-    {"country",  "USA"},
-
-    // Numeric strings
-    {"age",      "30"},
-    {"score",    "9001"},
-    {"pi",       "3.14159"},
-
-    // Longer values
-    {"bio",      "Software engineer who loves systems programming"},
-    {"address",  "123 Main St, Apt 4B"},
-
-    // Edge cases
-    {"empty",    ""},
-    {"spaces",   "hello world"},
-    {"special",  "foo!@#$%^&*()bar"},
-    {"unicode",  "héllo wörld"},
-
-    // Key/value with similar names
-    {"user:1",   "Alice"},
-    {"user:2",   "Bob"},
-    {"user:3",   "Charlie"},
-};
-
-static void do_request(std::vector<std::string> &cmd, Response &out) {
-    if (cmd.size() == 2 && cmd[0] == "get") {
-        auto it = g_data.find(cmd[1]);
-        if (it == g_data.end()) {
-            out.status = RES_NX;    // not found
-            return;
-        }
-        const std::string &val = it->second;
-        out.data.assign(val.begin(), val.end());
-    } else if (cmd.size() == 3 && cmd[0] == "set") {
-        g_data[cmd[1]].swap(cmd[2]);
-    } else if (cmd.size() == 2 && cmd[0] == "del") {
-        g_data.erase(cmd[1]);
-    } else {
-        out.status = RES_ERR;       // unrecognized command
-    }
 }
 
 const size_t k_max_args = 200 * 1000;
